@@ -1,113 +1,281 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
+#include <unistd.h>
 #include <sched.h>
+#include <signal.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <signal.h>
-#include <sys/ioctl.h>
-
-#include "monitor_ioctl.h"
 
 #define STACK_SIZE (1024 * 1024)
+#define CONTROL_PATH "/tmp/mini_runtime.sock"
 
-struct child_args {
-    char id[32];
-    char rootfs[256];
-    char program[256];
-};
+/* ================= CONTAINER ================= */
 
-static int monitor_fd = -1;
+typedef struct container {
+    char id[64];
+    pid_t pid;
+    int state;
+    int stop_requested;
+    int killed_by_limit;
+    struct container *next;
+} container_t;
 
-/* register container to kernel monitor */
-void monitor_register(pid_t pid, const char *name)
-{
-    if (monitor_fd < 0)
-        return;
+#define CONTAINER_RUNNING 1
+#define CONTAINER_EXITED  2
 
-    struct container_info ci;
-    ci.pid = pid;
-    strncpy(ci.name, name, sizeof(ci.name));
+typedef struct {
+    container_t *containers;
+} context_t;
 
-    ioctl(monitor_fd, MONITOR_IOC_REGISTER, &ci);
+context_t *g_ctx;
+
+/* ================= FIND ================= */
+
+container_t *find_container_by_pid(pid_t pid) {
+    container_t *c = g_ctx->containers;
+    while (c) {
+        if (c->pid == pid)
+            return c;
+        c = c->next;
+    }
+    return NULL;
 }
 
-/* unregister container */
-void monitor_unregister(pid_t pid, const char *name)
-{
-    if (monitor_fd < 0)
-        return;
+/* ================= CHILD ================= */
 
-    struct container_info ci;
-    ci.pid = pid;
-    strncpy(ci.name, name, sizeof(ci.name));
+int child_fn(void *arg) {
+    char **args = (char **)arg;
 
-    ioctl(monitor_fd, MONITOR_IOC_UNREGISTER, &ci);
-}
+    char *id     = args[0];
+    char *rootfs = args[1];
+    char *cmd    = args[2];
 
-/* child process (container) */
-static int container_child(void *arg)
-{
-    struct child_args *a = arg;
+    sethostname(id, strlen(id));
 
-    sethostname(a->id, strlen(a->id));
-
-    if (chroot(a->rootfs) != 0) {
+    if (chroot(rootfs) != 0) {
         perror("chroot");
-        exit(1);
+        return 1;
     }
 
     chdir("/");
 
-    char *const argv[] = { a->program, NULL };
-    execvp(argv[0], argv);
+    mkdir("/proc", 0555);
+    mount("proc", "/proc", "proc", 0, NULL);
 
-    perror("exec");
+    execl(cmd, cmd, NULL);
+
+    perror("exec failed");
     return 1;
 }
 
-int main(int argc, char *argv[])
-{
-    if (argc < 5) {
-        printf("Usage: %s run <id> <rootfs> <program>\n", argv[0]);
-        return 1;
+/* ================= LAUNCH ================= */
+
+pid_t launch_container(char *id, char *rootfs, char *cmd) {
+    char *stack = malloc(STACK_SIZE);
+    char *stack_top = stack + STACK_SIZE;
+
+    char **args = malloc(sizeof(char*) * 3);
+    args[0] = id;
+    args[1] = rootfs;
+    args[2] = cmd;
+
+    int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
+
+    pid_t pid = clone(child_fn, stack_top, flags, args);
+    return pid;
+}
+
+/* ================= SIGCHLD ================= */
+
+void sigchld_handler(int sig) {
+    int status;
+    pid_t pid;
+
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+
+        container_t *c = find_container_by_pid(pid);
+        if (!c) continue;
+
+        if (WIFSIGNALED(status)) {
+            int s = WTERMSIG(status);
+
+            if (s == SIGKILL && !c->stop_requested) {
+                c->killed_by_limit = 1;
+            }
+        }
+
+        c->state = CONTAINER_EXITED;
+    }
+}
+
+/* ================= HANDLE CLIENT ================= */
+
+void handle_client(int client) {
+    char buf[256] = {0};
+
+    int n = read(client, buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        close(client);
+        return;
     }
 
-    monitor_fd = open("/dev/monitor", O_RDWR);
+    char cmd_name[32] = {0};
+    char id[64] = {0};
+    char rootfs[128] = {0};
+    char cmd[128] = {0};
 
-    struct child_args args;
-    strncpy(args.id, argv[2], sizeof(args.id));
-    strncpy(args.rootfs, argv[3], sizeof(args.rootfs));
-    strncpy(args.program, argv[4], sizeof(args.program));
+    sscanf(buf, "%s %s %s %s", cmd_name, id, rootfs, cmd);
 
-    void *stack = malloc(STACK_SIZE);
-    if (!stack) {
-        perror("malloc");
-        return 1;
+    /* ===== START ===== */
+    if (strcmp(cmd_name, "start") == 0) {
+
+        pid_t pid = launch_container(id, rootfs, cmd);
+
+        container_t *newc = malloc(sizeof(container_t));
+        strcpy(newc->id, id);
+        newc->pid = pid;
+        newc->state = CONTAINER_RUNNING;
+        newc->stop_requested = 0;
+        newc->killed_by_limit = 0;
+
+        newc->next = g_ctx->containers;
+        g_ctx->containers = newc;
+
+        write(client, "OK\n", 3);
     }
 
-    pid_t pid = clone(container_child,
-                      stack + STACK_SIZE,
-                      CLONE_NEWUTS | CLONE_NEWPID | SIGCHLD,
-                      &args);
+    /* ===== PS ===== */
+    else if (strcmp(cmd_name, "ps") == 0) {
 
-    if (pid < 0) {
-        perror("clone");
-        return 1;
+        container_t *c = g_ctx->containers;
+
+        if (!c) {
+            write(client, "No containers\n", 14);
+        }
+
+        while (c) {
+            char line[128];
+
+            if (c->killed_by_limit)
+                snprintf(line, sizeof(line), "%s %d hard_limit_killed\n", c->id, c->pid);
+            else if (c->stop_requested)
+                snprintf(line, sizeof(line), "%s %d stopped\n", c->id, c->pid);
+            else if (c->state == CONTAINER_RUNNING)
+                snprintf(line, sizeof(line), "%s %d running\n", c->id, c->pid);
+            else
+                snprintf(line, sizeof(line), "%s %d exited\n", c->id, c->pid);
+
+            write(client, line, strlen(line));
+            c = c->next;
+        }
     }
 
-    printf("[%s] started with pid %d\n", args.id, pid);
+    /* ===== STOP ===== */
+    else if (strcmp(cmd_name, "stop") == 0) {
 
-    monitor_register(pid, args.id);
+        container_t *c = g_ctx->containers;
 
-    waitpid(pid, NULL, 0);
+        while (c) {
+            if (strcmp(c->id, id) == 0) {
+                c->stop_requested = 1;
+                kill(c->pid, SIGTERM);
+                write(client, "Stopped\n", 8);
+                break;
+            }
+            c = c->next;
+        }
+    }
 
-    monitor_unregister(pid, args.id);
+    close(client);
+}
+
+/* ================= SUPERVISOR ================= */
+
+void run_supervisor() {
+    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    struct sockaddr_un addr;
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, CONTROL_PATH);
+
+    unlink(CONTROL_PATH);
+
+    bind(server_fd, (struct sockaddr *)&addr, sizeof(addr));
+    listen(server_fd, 5);
+
+    printf("Supervisor ready on %s\n", CONTROL_PATH);
+
+    signal(SIGCHLD, sigchld_handler);
+
+    while (1) {
+        int client = accept(server_fd, NULL, NULL);
+        if (client >= 0) {
+            handle_client(client);
+        }
+    }
+}
+
+/* ================= CLIENT ================= */
+
+void send_cmd(char *msg) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    struct sockaddr_un addr;
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, CONTROL_PATH);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("connect");
+        return;
+    }
+
+    write(fd, msg, strlen(msg));
+
+    char buf[512];
+    int n;
+
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        write(STDOUT_FILENO, buf, n);
+    }
+
+    close(fd);
+}
+
+/* ================= MAIN ================= */
+
+int main(int argc, char *argv[]) {
+
+    if (argc < 2) {
+        printf("Usage:\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "supervisor") == 0) {
+        g_ctx = calloc(1, sizeof(context_t));
+        run_supervisor();
+    }
+
+    else if (strcmp(argv[1], "start") == 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "start %s %s %s",
+                 argv[2], argv[3], argv[4]);
+        send_cmd(msg);
+    }
+
+    else if (strcmp(argv[1], "ps") == 0) {
+        send_cmd("ps");
+    }
+
+    else if (strcmp(argv[1], "stop") == 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "stop %s", argv[2]);
+        send_cmd(msg);
+    }
 
     return 0;
 }
