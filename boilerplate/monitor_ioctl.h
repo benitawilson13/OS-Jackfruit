@@ -1,25 +1,18 @@
 #ifndef MONITOR_IOCTL_H
 #define MONITOR_IOCTL_H
 
-#ifdef __KERNEL__
 #include <linux/ioctl.h>
-#include <linux/types.h>
-#else
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#endif
 
-#define MONITOR_NAME_LEN 32
+#define MAX_NAME 32
 
-struct monitor_request {
-    pid_t pid;
-    unsigned long soft_limit_bytes;
-    unsigned long hard_limit_bytes;
-    char container_id[MONITOR_NAME_LEN];
+/* structure passed between engine and kernel module */
+struct container_info {
+    int pid;
+    char name[MAX_NAME];
 };
 
-#define MONITOR_MAGIC 'M'
-#define MONITOR_REGISTER _IOW(MONITOR_MAGIC, 1, struct monitor_request)
-#define MONITOR_UNREGISTER _IOW(MONITOR_MAGIC, 2, struct monitor_request)
+/* ioctl commands */
+#define MONITOR_IOC_REGISTER   _IOW('m', 1, struct container_info)
+#define MONITOR_IOC_UNREGISTER _IOW('m', 2, struct container_info)
 
 #endif
