@@ -2,83 +2,87 @@
 #include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
+#include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/slab.h>
 
-#define DEVICE_NAME "container_monitor"
-#define CLASS_NAME  "monitor"
+#include "monitor_ioctl.h"
 
-static int    majorNumber;
-static struct class*  monitorClass  = NULL;
-static struct device* monitorDevice = NULL;
+#define DEVICE_NAME "monitor"
 
-static ssize_t monitor_write(struct file *file,
-                             const char __user *buffer,
-                             size_t len,
-                             loff_t *offset)
+static dev_t dev_num;
+static struct cdev monitor_cdev;
+static struct class *monitor_class;
+
+static long monitor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    char kbuf[32];
-    long pid;
+    struct container_info ci;
 
-    if (len > 31)
-        len = 31;
-
-    if (copy_from_user(kbuf, buffer, len))
+    if (copy_from_user(&ci, (void __user *)arg, sizeof(ci)))
         return -EFAULT;
 
-    kbuf[len] = '\0';
+    switch (cmd) {
+    case MONITOR_IOC_REGISTER:
+        printk(KERN_INFO "monitor: register pid=%d name=%s\n",
+               ci.pid, ci.name);
+        break;
 
-    if (kstrtol(kbuf, 10, &pid) < 0)
+    case MONITOR_IOC_UNREGISTER:
+        printk(KERN_INFO "monitor: unregister pid=%d name=%s\n",
+               ci.pid, ci.name);
+        break;
+
+    default:
         return -EINVAL;
+    }
 
-    printk(KERN_INFO "container_monitor: received pid %ld\n", pid);
-
-    return len;
+    return 0;
 }
 
-static struct file_operations fops =
+static int monitor_open(struct inode *inode, struct file *file)
 {
+    return 0;
+}
+
+static int monitor_release(struct inode *inode, struct file *file)
+{
+    return 0;
+}
+
+static const struct file_operations fops = {
     .owner = THIS_MODULE,
-    .write = monitor_write,
+    .open = monitor_open,
+    .release = monitor_release,
+    .unlocked_ioctl = monitor_ioctl,
 };
 
 static int __init monitor_init(void)
 {
-    majorNumber = register_chrdev(0, DEVICE_NAME, &fops);
-    if (majorNumber < 0)
-    {
-        printk(KERN_ALERT "Failed to register major number\n");
-        return majorNumber;
-    }
+    alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
 
-    monitorClass = class_create(CLASS_NAME);
-    if (IS_ERR(monitorClass))
-    {
-        unregister_chrdev(majorNumber, DEVICE_NAME);
-        return PTR_ERR(monitorClass);
-    }
+    cdev_init(&monitor_cdev, &fops);
+    cdev_add(&monitor_cdev, dev_num, 1);
 
-    monitorDevice = device_create(monitorClass, NULL,
-                                 MKDEV(majorNumber, 0),
-                                 NULL, DEVICE_NAME);
+    monitor_class = class_create("monitor_class");
+    device_create(monitor_class, NULL, dev_num, NULL, DEVICE_NAME);
 
-    printk(KERN_INFO "container_monitor loaded\n");
+    printk(KERN_INFO "monitor: module loaded\n");
     return 0;
 }
 
 static void __exit monitor_exit(void)
 {
-    device_destroy(monitorClass, MKDEV(majorNumber, 0));
-    class_unregister(monitorClass);
-    class_destroy(monitorClass);
-    unregister_chrdev(majorNumber, DEVICE_NAME);
+    device_destroy(monitor_class, dev_num);
+    class_destroy(monitor_class);
+    cdev_del(&monitor_cdev);
+    unregister_chrdev_region(dev_num, 1);
 
-    printk(KERN_INFO "container_monitor unloaded\n");
+    printk(KERN_INFO "monitor: module unloaded\n");
 }
 
 module_init(monitor_init);
 module_exit(monitor_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Student");
-MODULE_DESCRIPTION("Container Monitor");
+MODULE_AUTHOR("OS-Jackfruit");
+MODULE_DESCRIPTION("Simple container monitor");
